@@ -198,6 +198,7 @@ ImportProject::Type ImportProject::import(const std::string &filename, Settings 
 
     const std::vector<std::string> fileFilters =
         settings ? settings->fileFilters : std::vector<std::string>();
+    std::vector<SharedItemsProject> sharedItemsProjects{};
 
     if (endsWith(filename, ".json")) {
         if (importCompileCommands(fin)) {
@@ -211,7 +212,7 @@ ImportProject::Type ImportProject::import(const std::string &filename, Settings 
         }
     } else if (endsWith(filename, ".vcxproj")) {
         std::map<std::string, std::string, cppcheck::stricmp> variables;
-        if (importVcxproj(filename, variables, emptyString, fileFilters)) {
+        if (importVcxproj(filename, variables, emptyString, fileFilters, sharedItemsProjects)) {
             setRelativePaths(filename);
             return ImportProject::Type::VS_VCXPROJ;
         }
@@ -474,33 +475,10 @@ bool ImportProject::importSln(std::istream &istr, const std::string &path, const
     variables["SolutionDir"] = path;
 
     bool found = false;
-
+    std::vector<SharedItemsProject> sharedItemsProjects{};
     while (std::getline(istr,line)) {
         if (line.compare(0,8,"Project(")!=0)
-            continue;
-
-        // NOTE(Felix): Custom code for vcxitems
-        {
-            const std::string::size_type pos = line.find(".vcxitems");
-            if (pos != std::string::npos)
-            {
-                const std::string::size_type pos1 = line.rfind('\"', pos);
-                if (pos1 != std::string::npos)
-                {
-                    std::string vcxitems(line.substr(pos1 + 1, pos - pos1 + 8));
-                    vcxitems = Path::toNativeSeparators(std::move(vcxitems));
-                    if (!Path::isAbsolute(vcxitems))
-                        vcxitems = path + vcxitems;
-                    vcxitems = Path::fromNativeSeparators(std::move(vcxitems));
-                    if (!importVcxitems(vcxitems, variables, emptyString, fileFilters)) {
-                        printError("failed to load '" + vcxitems + "' from Visual Studio solution");
-                        return false;
-                    }
-                    found = true;
-                }
-            }
-        }
-        
+            continue;        
         const std::string::size_type pos = line.find(".vcxproj");
         if (pos == std::string::npos)
             continue;
@@ -510,7 +488,7 @@ bool ImportProject::importSln(std::istream &istr, const std::string &path, const
         std::string vcxproj(line.substr(pos1+1, pos-pos1+7));
         if (!Path::isAbsolute(vcxproj))
             vcxproj = path + vcxproj;
-        if (!importVcxproj(Path::fromNativeSeparators(vcxproj), variables, emptyString, fileFilters)) {
+        if (!importVcxproj(Path::fromNativeSeparators(vcxproj), variables, emptyString, fileFilters, sharedItemsProjects)) {
             printError("failed to load '" + vcxproj + "' from Visual Studio solution");
             return false;
         }
@@ -728,7 +706,7 @@ static void loadVisualStudioProperties(const std::string &props, std::map<std::s
     }
 }
 
-bool ImportProject::importVcxproj(const std::string &filename, std::map<std::string, std::string, cppcheck::stricmp> &variables, const std::string &additionalIncludeDirectories, const std::vector<std::string> &fileFilters)
+bool ImportProject::importVcxproj(const std::string& filename, std::map<std::string, std::string, cppcheck::stricmp>& variables, const std::string& additionalIncludeDirectories, const std::vector<std::string>& fileFilters, std::vector<SharedItemsProject>& cache)
 {
     variables["ProjectDir"] = Path::simplifyPath(Path::getPathFromFilename(filename));
 
@@ -736,123 +714,7 @@ bool ImportProject::importVcxproj(const std::string &filename, std::map<std::str
     std::list<std::string> compileList;
     std::list<ItemDefinitionGroup> itemDefinitionGroupList;
     std::string includePath;
-
-    bool useOfMfc = false;
-
-    tinyxml2::XMLDocument doc;
-    const tinyxml2::XMLError error = doc.LoadFile(filename.c_str());
-    if (error != tinyxml2::XML_SUCCESS) {
-        printError(std::string("Visual Studio project file is not a valid XML - ") + tinyxml2::XMLDocument::ErrorIDToName(error));
-        return false;
-    }
-    const tinyxml2::XMLElement * const rootnode = doc.FirstChildElement();
-    if (rootnode == nullptr) {
-        printError("Visual Studio project file has no XML root node");
-        return false;
-    }
-    for (const tinyxml2::XMLElement *node = rootnode->FirstChildElement(); node; node = node->NextSiblingElement()) {
-        if (std::strcmp(node->Name(), "ItemGroup") == 0) {
-            const char *labelAttribute = node->Attribute("Label");
-            if (labelAttribute && std::strcmp(labelAttribute, "ProjectConfigurations") == 0) {
-                for (const tinyxml2::XMLElement *cfg = node->FirstChildElement(); cfg; cfg = cfg->NextSiblingElement()) {
-                    if (std::strcmp(cfg->Name(), "ProjectConfiguration") == 0) {
-                        const ProjectConfiguration p(cfg);
-                        if (p.platform != ProjectConfiguration::Unknown) {
-                            projectConfigurationList.emplace_back(cfg);
-                            mAllVSConfigs.insert(p.configuration);
-                        }
-                    }
-                }
-            } else {
-                for (const tinyxml2::XMLElement *e = node->FirstChildElement(); e; e = e->NextSiblingElement()) {
-                    if (std::strcmp(e->Name(), "ClCompile") == 0) {
-                        const char *include = e->Attribute("Include");
-                        if (include && Path::acceptFile(include))
-                            compileList.emplace_back(include);
-                    }
-                }
-            }
-        } else if (std::strcmp(node->Name(), "ItemDefinitionGroup") == 0) {
-            itemDefinitionGroupList.emplace_back(node, additionalIncludeDirectories);
-        } else if (std::strcmp(node->Name(), "PropertyGroup") == 0) {
-            importPropertyGroup(node, variables, includePath, &useOfMfc);
-        } else if (std::strcmp(node->Name(), "ImportGroup") == 0) {
-            const char *labelAttribute = node->Attribute("Label");
-            if (labelAttribute && std::strcmp(labelAttribute, "PropertySheets") == 0) {
-                for (const tinyxml2::XMLElement *e = node->FirstChildElement(); e; e = e->NextSiblingElement()) {
-                    if (std::strcmp(e->Name(), "Import") == 0) {
-                        const char *projectAttribute = e->Attribute("Project");
-                        if (projectAttribute)
-                            loadVisualStudioProperties(projectAttribute, variables, includePath, additionalIncludeDirectories, itemDefinitionGroupList);
-                    }
-                }
-            }
-        }
-    }
-
-    for (const std::string &c : compileList) {
-        const std::string cfilename = Path::simplifyPath(Path::isAbsolute(c) ? c : Path::getPathFromFilename(filename) + c);
-        if (!fileFilters.empty() && !matchglobs(fileFilters, cfilename))
-            continue;
-
-        for (const ProjectConfiguration &p : projectConfigurationList) {
-
-            if (!guiProject.checkVsConfigs.empty()) {
-                const bool doChecking = std::any_of(guiProject.checkVsConfigs.cbegin(), guiProject.checkVsConfigs.cend(), [&](const std::string& c) {
-                    return c == p.configuration;
-                });
-                if (!doChecking)
-                    continue;
-            }
-
-            FileSettings fs;
-            fs.filename = cfilename;
-            fs.cfg = p.name;
-            fs.msc = true;
-            fs.useMfc = useOfMfc;
-            fs.defines = "_WIN32=1";
-            if (p.platform == ProjectConfiguration::Win32)
-                fs.platformType = cppcheck::Platform::Type::Win32W;
-            else if (p.platform == ProjectConfiguration::x64) {
-                fs.platformType = cppcheck::Platform::Type::Win64;
-                fs.defines += ";_WIN64=1";
-            }
-            std::string additionalIncludePaths;
-            for (const ItemDefinitionGroup &i : itemDefinitionGroupList) {
-                if (!i.conditionIsTrue(p))
-                    continue;
-                fs.standard = Standards::getCPP(i.cppstd);
-                fs.defines += ';' + i.preprocessorDefinitions;
-                if (i.enhancedInstructionSet == "StreamingSIMDExtensions")
-                    fs.defines += ";__SSE__";
-                else if (i.enhancedInstructionSet == "StreamingSIMDExtensions2")
-                    fs.defines += ";__SSE2__";
-                else if (i.enhancedInstructionSet == "AdvancedVectorExtensions")
-                    fs.defines += ";__AVX__";
-                else if (i.enhancedInstructionSet == "AdvancedVectorExtensions2")
-                    fs.defines += ";__AVX2__";
-                else if (i.enhancedInstructionSet == "AdvancedVectorExtensions512")
-                    fs.defines += ";__AVX512__";
-                additionalIncludePaths += ';' + i.additionalIncludePaths;
-            }
-            fs.setDefines(fs.defines);
-            fs.setIncludePaths(Path::getPathFromFilename(filename), toStringList(includePath + ';' + additionalIncludePaths), variables);
-            fileSettings.push_back(std::move(fs));
-        }
-    }
-
-    return true;
-}
-
-
-bool ImportProject::importVcxitems(const std::string& filename, std::map<std::string, std::string, cppcheck::stricmp>& variables, const std::string& additionalIncludeDirectories, const std::vector<std::string>& fileFilters)
-{
-    variables["ProjectDir"] = Path::simplifyPath(Path::getPathFromFilename(filename));
-
-    std::list<ProjectConfiguration> projectConfigurationList;
-    std::list<std::string> compileList;
-    std::list<ItemDefinitionGroup> itemDefinitionGroupList;
-    std::string includePath;
+    std::vector<SharedItemsProject> sharedItemsProjects;
 
     bool useOfMfc = false;
 
@@ -908,45 +770,57 @@ bool ImportProject::importVcxitems(const std::string& filename, std::map<std::st
                     }
                 }
             }
-        }
-    }
-    // # TODO: support signedness of char via /J (and potential XML option for it)?
-    // we can only set it globally but in this context it needs to be treated per file
-    for (const std::string& c : compileList) {
-        std::string cfilename = Path::simplifyPath(Path::isAbsolute(c) ? c : Path::getPathFromFilename(filename) + c);
-
-        // Remove "msbuild this file directory"
-        {
-            std::string toRemove("$(MSBuildThisFileDirectory)");
-            size_t pos = cfilename.find(toRemove);
-            while (pos != std::string::npos)
-            {
-                auto test = cfilename.erase(pos, toRemove.length());
-                pos = cfilename.find(toRemove);
+            else if (labelAttribute && std::strcmp(labelAttribute, "Shared") == 0) {
+                for (const tinyxml2::XMLElement* e = node->FirstChildElement(); e; e = e->NextSiblingElement()) {
+                    if (std::strcmp(e->Name(), "Import") == 0) {
+                        const char* projectAttribute = e->Attribute("Project");
+                        if (projectAttribute)
+                        {
+                            std::string pathToSharedItemsFile(projectAttribute);
+                            if (!simplifyPathWithVariables(pathToSharedItemsFile, variables)) {
+                                printError("Could not simplify path to referenced shared items project");
+                                exit(-1);
+                            }
+                            sharedItemsProjects.emplace_back(importVcxitems(pathToSharedItemsFile, fileFilters, cache));
+                        }
+                    }
+                }
             }
         }
+    }
 
+    // Project files
+    for (const std::string& c : compileList) {
+        const std::string cfilename = Path::simplifyPath(Path::isAbsolute(c) ? c : Path::getPathFromFilename(filename) + c);
         if (!fileFilters.empty() && !matchglobs(fileFilters, cfilename))
             continue;
 
-        // TODO(Felix): make this robust by iterating over the projects,
-        // checking retrieving their configurations and add them 
-        // if this the shared item project is referenced
-        
-        // Assuming x64 configuration
-        std::string configs[] = { "Debug|x64", "Release|x64", };
-        for (auto& c : configs)
-        {
+        for (const ProjectConfiguration& p : projectConfigurationList) {
+
+            if (!guiProject.checkVsConfigs.empty()) {
+                const bool doChecking = std::any_of(guiProject.checkVsConfigs.cbegin(), guiProject.checkVsConfigs.cend(), [&](const std::string& c) {
+                    return c == p.configuration;
+                    });
+                if (!doChecking)
+                    continue;
+            }
+
             FileSettings fs;
             fs.filename = cfilename;
-            fs.cfg = c;
-            // TODO: detect actual MSC version
+            fs.cfg = p.name;
             fs.msc = true;
             fs.useMfc = useOfMfc;
-            fs.defines = "_WIN32=1;_WIN64=1";
-            fs.platformType = cppcheck::Platform::Type::Win64;
+            fs.defines = "_WIN32=1";
+            if (p.platform == ProjectConfiguration::Win32)
+                fs.platformType = cppcheck::Platform::Type::Win32W;
+            else if (p.platform == ProjectConfiguration::x64) {
+                fs.platformType = cppcheck::Platform::Type::Win64;
+                fs.defines += ";_WIN64=1";
+            }
             std::string additionalIncludePaths;
             for (const ItemDefinitionGroup& i : itemDefinitionGroupList) {
+                if (!i.conditionIsTrue(p))
+                    continue;
                 fs.standard = Standards::getCPP(i.cppstd);
                 fs.defines += ';' + i.preprocessorDefinitions;
                 if (i.enhancedInstructionSet == "StreamingSIMDExtensions")
@@ -967,7 +841,140 @@ bool ImportProject::importVcxitems(const std::string& filename, std::map<std::st
         }
     }
 
+    // Shared items files
+    for (const auto& sharedProject : sharedItemsProjects) {
+        for (const auto& c : sharedProject.sourceFiles) {
+            const std::string cfilename = Path::simplifyPath(c);
+            if (!fileFilters.empty() && !matchglobs(fileFilters, cfilename))
+                continue;
+
+            for (const ProjectConfiguration& p : projectConfigurationList) {
+                if (!guiProject.checkVsConfigs.empty()) {
+                    const bool doChecking = std::any_of(guiProject.checkVsConfigs.cbegin(), guiProject.checkVsConfigs.cend(), [&](const std::string& c) {
+                        return c == p.configuration;
+                        });
+                    if (!doChecking)
+                        continue;
+                }
+
+                FileSettings fs;
+                fs.filename = cfilename;
+                fs.cfg = p.name;
+                fs.msc = true;
+                fs.useMfc = useOfMfc;
+                fs.defines = "_WIN32=1";
+                if (p.platform == ProjectConfiguration::Win32)
+                    fs.platformType = cppcheck::Platform::Type::Win32W;
+                else if (p.platform == ProjectConfiguration::x64) {
+                    fs.platformType = cppcheck::Platform::Type::Win64;
+                    fs.defines += ";_WIN64=1";
+                }
+                std::string additionalIncludePaths;
+                for (const ItemDefinitionGroup& i : itemDefinitionGroupList) {
+                    if (!i.conditionIsTrue(p))
+                        continue;
+                    fs.standard = Standards::getCPP(i.cppstd);
+                    fs.defines += ';' + i.preprocessorDefinitions;
+                    if (i.enhancedInstructionSet == "StreamingSIMDExtensions")
+                        fs.defines += ";__SSE__";
+                    else if (i.enhancedInstructionSet == "StreamingSIMDExtensions2")
+                        fs.defines += ";__SSE2__";
+                    else if (i.enhancedInstructionSet == "AdvancedVectorExtensions")
+                        fs.defines += ";__AVX__";
+                    else if (i.enhancedInstructionSet == "AdvancedVectorExtensions2")
+                        fs.defines += ";__AVX2__";
+                    else if (i.enhancedInstructionSet == "AdvancedVectorExtensions512")
+                        fs.defines += ";__AVX512__";
+                    additionalIncludePaths += ';' + i.additionalIncludePaths;
+                }
+                fs.setDefines(fs.defines);
+                fs.setIncludePaths(Path::getPathFromFilename(filename), toStringList(includePath + ';' + additionalIncludePaths), variables);
+                for (const auto& toAddIncludePath : sharedProject.includePaths) {
+                    fs.includePaths.emplace_back(Path::simplifyPath(toAddIncludePath));
+                }
+                fileSettings.push_back(std::move(fs));
+            }
+        }
+    }
+
     return true;
+}
+
+static std::string stringReplace(const std::string& original, const std::string& toReplace, const std::string& replaceWith) 
+{
+    std::string result(original);
+    size_t pos = result.find(toReplace);
+    while (pos != std::string::npos) {
+        result.replace(pos, toReplace.length(), replaceWith);
+        pos = result.find(toReplace);
+    }
+    return result;
+}
+
+ImportProject::SharedItemsProject ImportProject::importVcxitems(const std::string& filename, const std::vector<std::string>& fileFilters, std::vector<SharedItemsProject> &cache)
+{
+    for (const auto& entry : cache)
+    {
+        if (filename == entry.pathToProjectFile)
+        {
+            return entry;
+        }
+    }
+
+    std::string projectDir = Path::simplifyPath(Path::getPathFromFilename(filename));
+    if (projectDir.empty())
+    {
+        projectDir = std::string("./");
+    }
+
+    SharedItemsProject result{};
+    result.pathToProjectFile = filename;
+
+    tinyxml2::XMLDocument doc;
+    const tinyxml2::XMLError error = doc.LoadFile(filename.c_str());
+    if (error != tinyxml2::XML_SUCCESS) {
+        printError(std::string("Visual Studio project file is not a valid XML - ") + tinyxml2::XMLDocument::ErrorIDToName(error));
+        exit(-1);
+    }
+    const tinyxml2::XMLElement* const rootnode = doc.FirstChildElement();
+    if (rootnode == nullptr) {
+        printError("Visual Studio project file has no XML root node");
+        exit(-1);
+    }
+    for (const tinyxml2::XMLElement* node = rootnode->FirstChildElement(); node; node = node->NextSiblingElement()) {
+        if (std::strcmp(node->Name(), "ItemGroup") == 0) {
+            const char* labelAttribute = node->Attribute("Label");
+            for (const tinyxml2::XMLElement* e = node->FirstChildElement(); e; e = e->NextSiblingElement()) {
+                if (std::strcmp(e->Name(), "ClCompile") == 0) {
+                    const char* include = e->Attribute("Include");
+                    if (include && Path::acceptFile(include)) {
+                        std::string filename = stringReplace(include, "$(MSBuildThisFileDirectory)", projectDir);
+
+                        // Don't include file if it matches the filter
+                        if (!fileFilters.empty() && !matchglobs(fileFilters, filename))
+                            continue;
+
+                        result.sourceFiles.emplace_back(filename);
+                    } else {
+                        printError("Could not find shared items source file");
+                        exit(-1);
+                    }
+                }
+            }
+        }
+        else if (std::strcmp(node->Name(), "ItemDefinitionGroup") == 0) {
+            ItemDefinitionGroup temp(node, "");
+            for (const auto& includePath : toStringList(temp.additionalIncludePaths)) {
+                if (includePath == std::string("%(AdditionalIncludeDirectories)"))
+                    continue;
+
+                result.includePaths.emplace_back(stringReplace(includePath, "$(MSBuildThisFileDirectory)", projectDir));
+            }
+        }
+    }
+
+    cache.emplace_back(result);
+    return result;
 }
 
 bool ImportProject::importBcb6Prj(const std::string &projectFilename)
