@@ -1,0 +1,3 @@
+[submodule "sw_shared"]
+	path = sw_shared
+	url = git@git.areus.de:areusdev/sw_general/sw_shared.git
